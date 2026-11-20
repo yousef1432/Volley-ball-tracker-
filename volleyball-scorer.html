@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>حكم الكرة الطائرة</title>
+<style>
+  :root{--bg:#0e1116;--card:#171c24;--a:#2e86ff;--b:#ff7a2e;--ok:#22c55e;--bad:#ef4444;--tx:#f2f5f9}
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  body{margin:0;background:var(--bg);color:var(--tx);font-family:system-ui,-apple-system,"Segoe UI",Tahoma,sans-serif}
+  .score{display:grid;grid-template-columns:1fr auto 1fr;gap:8px;padding:10px;align-items:center}
+  .team{background:var(--card);border-radius:14px;padding:8px 10px;text-align:center;border:2px solid transparent}
+  .team.a{border-color:var(--a)} .team.b{border-color:var(--b)}
+  .team .n{font-size:13px;opacity:.8}
+  .team .p{font-size:44px;font-weight:800;line-height:1.1}
+  .team .s{font-size:12px;opacity:.7}
+  .serve::after{content:" 🏐";}
+  .mid{text-align:center;font-size:12px;opacity:.8}
+  .mid b{display:block;font-size:20px}
+  #stage{position:relative;width:100%;background:#000;margin:0 auto;aspect-ratio:16/9}
+  video,canvas{position:absolute;inset:0;width:100%;height:100%}
+  #msg{position:absolute;left:8px;right:8px;top:8px;background:rgba(0,0,0,.65);padding:8px 10px;border-radius:10px;font-size:14px;z-index:5}
+  #toast{position:absolute;left:8px;right:8px;bottom:8px;background:rgba(0,0,0,.8);padding:10px;border-radius:12px;display:none;z-index:6;align-items:center;justify-content:space-between;gap:8px}
+  #toast button{background:var(--bad);color:#fff;border:0;border-radius:8px;padding:8px 12px;font-size:14px}
+  .bar{display:flex;flex-wrap:wrap;gap:8px;padding:10px}
+  .bar button{flex:1 1 30%;background:var(--card);color:var(--tx);border:1px solid #2a3340;border-radius:12px;padding:12px 6px;font-size:14px}
+  .bar button.main{background:var(--a);border:0;font-weight:700}
+  .bar button.a{border-color:var(--a)} .bar button.b{border-color:var(--b)}
+  #log{padding:0 12px 20px;font-size:12px;opacity:.75;line-height:1.7}
+</style>
+</head>
+<body>
+<div class="score">
+  <div class="team a"><div class="n">فريق أ (القريب)</div><div class="p" id="pa">0</div><div class="s">أشواط: <span id="sa">0</span></div></div>
+  <div class="mid">الشوط<b id="set">1</b>الهدف <span id="tgt">25</span></div>
+  <div class="team b"><div class="n">فريق ب (البعيد)</div><div class="p" id="pb">0</div><div class="s">أشواط: <span id="sb">0</span></div></div>
+</div>
+
+<div id="stage">
+  <video id="v" playsinline muted autoplay></video>
+  <canvas id="c"></canvas>
+  <div id="msg">اضغط «تشغيل الكاميرا»</div>
+  <div id="toast"><span id="toastTxt"></span><button id="undoBtn">إلغاء</button></div>
+</div>
+
+<div class="bar">
+  <button class="main" id="startBtn">تشغيل الكاميرا</button>
+  <button id="calBtn" disabled>معايرة الملعب</button>
+  <button id="flipBtn" disabled>تبديل الكاميرا</button>
+  <button class="a" id="addA">+1 أ</button>
+  <button class="b" id="addB">+1 ب</button>
+  <button id="undoLast">تراجع</button>
+  <button id="newSet">شوط جديد / إعادة</button>
+</div>
+<div id="log"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.17.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
+<script>
+/* ================= حالة المباراة (قوانين الكرة الطائرة: Rally Point) =================
+   - الشوط حتى 25 بفارق نقطتين (بدون سقف)، والشوط الخامس حتى 15 بفارق نقطتين
+   - أفضل من 5 أشواط (أول من يفوز بـ3)
+   - كل كرة = نقطة، والفريق الذي يسجل النقطة هو الذي يرسل
+   - الكرة على الخط = داخل
+   - كرة تلمس الأرض داخل الملعب = نقطة لمنافس الفريق الذي سقطت في ملعبه
+   - كرة خارج الملعب = نقطة لمنافس الفريق الذي ضربها */
+const S = {pts:{A:0,B:0}, sets:{A:0,B:0}, set:1, server:'A', over:false, hist:[]};
+const $ = id => document.getElementById(id);
+const other = t => t==='A' ? 'B' : 'A';
+const name = t => t==='A' ? 'فريق أ' : 'فريق ب';
+const target = () => S.set===5 ? 15 : 25;
+
+function render(){
+  $('pa').textContent=S.pts.A; $('pb').textContent=S.pts.B;
+  $('sa').textContent=S.sets.A; $('sb').textContent=S.sets.B;
+  $('set').textContent=S.set; $('tgt').textContent=target();
+  document.querySelector('.team.a .n').classList.toggle('serve',S.server==='A');
+  document.querySelector('.team.b .n').classList.toggle('serve',S.server==='B');
+}
+function log(t){ const d=$('log'); d.innerHTML = t+'<br>'+d.innerHTML; }
+
+function addPoint(team, reason){
+  if(S.over) return;
+  S.hist.push(JSON.stringify({pts:S.pts,sets:S.sets,set:S.set,server:S.server,over:S.over}));
+  S.pts[team]++; S.server=team;
+  log(`نقطة ${name(team)} — ${reason}  (${S.pts.A}-${S.pts.B})`);
+  const t=target();
+  if(S.pts[team]>=t && S.pts[team]-S.pts[other(team)]>=2){
+    S.sets[team]++;
+    log(`🏆 ${name(team)} يفوز بالشوط ${S.set}`);
+    if(S.sets[team]===3){ S.over=true; log(`🎉 انتهت المباراة: ${name(team)} الفائز`); }
+    else { S.set++; S.pts={A:0,B:0}; }
+  }
+  navigator.vibrate && navigator.vibrate(120);
+  render();
+}
+function undo(){
+  const h=S.hist.pop(); if(!h) return;
+  Object.assign(S, JSON.parse(h)); log('↩︎ تم التراجع'); render();
+}
+$('addA').onclick=()=>addPoint('A','يدوي');
+$('addB').onclick=()=>addPoint('B','يدوي');
+$('undoLast').onclick=undo;
+$('newSet').onclick=()=>{ if(confirm('بدء مباراة جديدة من الصفر؟')){ S.pts={A:0,B:0};S.sets={A:0,B:0};S.set=1;S.server='A';S.over=false;S.hist=[];$('log').innerHTML='';render(); } };
+
+/* ================= الكاميرا ================= */
+const v=$('v'), c=$('c'), ctx=c.getContext('2d');
+let facing='environment', stream=null, model=null;
+
+async function startCam(){
+  if(stream) stream.getTracks().forEach(t=>t.stop());
+  try{
+    stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:facing,width:{ideal:1280},height:{ideal:720}},audio:false});
+  }catch(e){ $('msg').textContent='تعذر فتح الكاميرا. لازم الصفحة تكون على رابط https وتسمح بالإذن.'; return; }
+  v.srcObject=stream; await v.play();
+  await new Promise(r=> v.videoWidth?r():v.onloadedmetadata=r);
+  c.width=v.videoWidth; c.height=v.videoHeight;
+  $('stage').style.aspectRatio=v.videoWidth+'/'+v.videoHeight;
+  $('calBtn').disabled=false; $('flipBtn').disabled=false;
+  $('startBtn').style.display='none';
+  if(!model){ $('msg').textContent='جاري تحميل نموذج كشف الكرة...'; model=await cocoSsd.load({base:'lite_mobilenet_v2'}); }
+  $('msg').textContent = H ? 'جاهز — يتم تتبع الكرة' : 'اضغط «معايرة الملعب» ثم حدد زوايا الملعب';
+  loop();
+}
+$('startBtn').onclick=startCam;
+$('flipBtn').onclick=()=>{ facing = facing==='environment'?'user':'environment'; startCam(); };
+
+/* ================= معايرة الملعب (تحويل Homography) =================
+   المستخدم يضغط 4 زوايا بالترتيب: القريب-يسار، القريب-يمين، البعيد-يمين، البعيد-يسار
+   الملعب 9م × 18م، الشبكة عند y=9 */
+let calPts=[], calibrating=false, H=null, Hinv=null;
+const COURT=[[0,18],[9,18],[9,0],[0,0]];
+const CORNER_NAMES=['الزاوية القريبة اليسرى','الزاوية القريبة اليمنى','الزاوية البعيدة اليمنى','الزاوية البعيدة اليسرى'];
+
+$('calBtn').onclick=()=>{ calPts=[]; H=null; calibrating=true; $('msg').textContent='اضغط على: '+CORNER_NAMES[0]; };
+c.addEventListener('pointerdown',e=>{
+  if(!calibrating) return;
+  const r=c.getBoundingClientRect();
+  calPts.push([(e.clientX-r.left)/r.width*c.width,(e.clientY-r.top)/r.height*c.height]);
+  if(calPts.length<4){ $('msg').textContent='اضغط على: '+CORNER_NAMES[calPts.length]; }
+  else { calibrating=false; H=homography(calPts,COURT); Hinv=homography(COURT,calPts); $('msg').textContent='تمت المعايرة ✅ — ثبّت الجوال ولا تحركه'; }
+});
+
+function homography(src,dst){ // يحل 8 معادلات
+  const A=[],b=[];
+  for(let i=0;i<4;i++){
+    const [x,y]=src[i],[u,w]=dst[i];
+    A.push([x,y,1,0,0,0,-u*x,-u*y]); b.push(u);
+    A.push([0,0,0,x,y,1,-w*x,-w*y]); b.push(w);
+  }
+  const n=8;
+  for(let i=0;i<n;i++){
+    let m=i; for(let r=i+1;r<n;r++) if(Math.abs(A[r][i])>Math.abs(A[m][i])) m=r;
+    [A[i],A[m]]=[A[m],A[i]]; [b[i],b[m]]=[b[m],b[i]];
+    for(let r=i+1;r<n;r++){ const f=A[r][i]/A[i][i]; for(let k=i;k<n;k++) A[r][k]-=f*A[i][k]; b[r]-=f*b[i]; }
+  }
+  const h=new Array(n);
+  for(let i=n-1;i>=0;i--){ let s=b[i]; for(let k=i+1;k<n;k++) s-=A[i][k]*h[k]; h[i]=s/A[i][i]; }
+  return [...h,1];
+}
+function apply(M,x,y){ const d=M[6]*x+M[7]*y+M[8]; return [(M[0]*x+M[1]*y+M[2])/d,(M[3]*x+M[4]*y+M[5])/d]; }
+
+/* ================= تتبع الكرة وكشف الملامسة ================= */
+const track=[]; // {t,x,y}
+let falling=false, fallStartY=0, maxPt=null, cand=null, flightStartSide=null, lastSideSeen=null;
+const TOL=0.05; // الخط داخل
+
+function sideOf(cy){ return cy>9 ? 'A' : 'B'; } // A القريب (y>9)
+
+function onBall(x,y,t){
+  const last=track[track.length-1];
+  if(last && Math.hypot(x-last.x,y-last.y) > c.width*0.3 && t-last.t<300) return; // قفزة غير منطقية
+  track.push({t,x,y}); if(track.length>40) track.shift();
+  if(!H) return;
+  // تقدير مكان الكرة (تقريبي أثناء الطيران) لمعرفة الفريق الضارب
+  const [cx,cy]=apply(H,x,y);
+  if(!falling && !cand) flightStartSide=sideOf(Math.min(18,Math.max(0,cy)));
+  const n=track.length; if(n<4) return;
+  const p=track[n-1], q=track[n-4];
+  const vy=(p.y-q.y)/((p.t-q.t)/1000); // بكسل/ثانية (موجب = نزول)
+  const H0=c.height;
+  if(cand){ // مرحلة التحقق: هل ارتدت الكرة عاليًا (ضربة/استقبال) أم لا
+    if(y < cand.y - cand.drop*0.5) cand=null; // ارتفعت كثيرًا = لمسها لاعب
+    return;
+  }
+  if(vy > H0*0.25){
+    if(!falling){ falling=true; fallStartY=q.y; maxPt=p; }
+    if(p.y>=maxPt.y) maxPt=p;
+  } else if(falling){
+    const drop=maxPt.y-fallStartY;
+    falling=false;
+    if(drop>H0*0.08) cand={x:maxPt.x,y:maxPt.y,drop,t:p.t,side:flightStartSide};
+  }
+}
+function checkMissing(now){
+  // الكرة اختفت (استقرت/دخلت الشبكة) بعد سقوط
+  const last=track[track.length-1];
+  if(falling && last && now-last.t>400 && maxPt){
+    const drop=maxPt.y-fallStartY; falling=false;
+    if(drop>c.height*0.08) cand={x:maxPt.x,y:maxPt.y,drop,t:last.t,side:flightStartSide};
+  }
+  if(cand && now-cand.t>500){ confirmLanding(cand); cand=null; track.length=0; }
+}
+
+let toastTimer=null, pending=null;
+function confirmLanding(L){
+  const [cx,cy]=apply(H,L.x,L.y);
+  const inside = cx>=-TOL && cx<=9+TOL && cy>=-TOL && cy<=18+TOL;
+  let team, reason;
+  if(inside){
+    const landed=sideOf(cy);
+    team=other(landed); reason=`الكرة لمست الأرض داخل ملعب ${name(landed)}`;
+  }else{
+    const hitter=L.side||lastSideSeen||'A';
+    team=other(hitter); reason=`كرة خارج الملعب (ضربها ${name(hitter)})`;
+  }
+  addPoint(team,reason);
+  showToast(reason);
+  flash={x:L.x,y:L.y,ok:inside,t:performance.now()};
+}
+function showToast(txt){
+  $('toastTxt').textContent=txt+' — غلط؟'; $('toast').style.display='flex';
+  clearTimeout(toastTimer); toastTimer=setTimeout(()=>$('toast').style.display='none',4000);
+}
+$('undoBtn').onclick=()=>{ undo(); $('toast').style.display='none'; };
+
+/* ================= الحلقة الرئيسية ================= */
+let flash=null, busy=false;
+async function detect(){
+  if(busy||!model||!H) return; busy=true;
+  try{
+    const preds=await model.detect(v,6,0.15);
+    const balls=preds.filter(p=>p.class==='sports ball').sort((a,b)=>b.score-a.score);
+    if(balls[0]){ const [bx,by,bw,bh]=balls[0].bbox; onBall(bx+bw/2, by+bh/2, performance.now()); lastBox=balls[0].bbox; }
+    else lastBox=null;
+  }catch(e){}
+  busy=false;
+}
+let lastBox=null;
+function draw(){
+  ctx.clearRect(0,0,c.width,c.height);
+  const pts = H ? COURT.map(p=>apply(Hinv,p[0],p[1])) : calPts;
+  ctx.lineWidth=4; ctx.strokeStyle='#22c55e'; ctx.fillStyle='#22c55e';
+  if(pts.length){
+    ctx.beginPath(); pts.forEach((p,i)=> i?ctx.lineTo(p[0],p[1]):ctx.moveTo(p[0],p[1]));
+    if(H) ctx.closePath(); ctx.stroke();
+    pts.forEach(p=>{ctx.beginPath();ctx.arc(p[0],p[1],8,0,7);ctx.fill();});
+  }
+  if(H){ // خط الشبكة
+    const a=apply(Hinv,0,9), b=apply(Hinv,9,9);
+    ctx.strokeStyle='#fff'; ctx.setLineDash([12,8]); ctx.beginPath(); ctx.moveTo(a[0],a[1]); ctx.lineTo(b[0],b[1]); ctx.stroke(); ctx.setLineDash([]);
+  }
+  if(lastBox){ ctx.strokeStyle='#facc15'; ctx.lineWidth=3; ctx.strokeRect(...lastBox); }
+  if(track.length>1){ ctx.strokeStyle='rgba(250,204,21,.6)'; ctx.lineWidth=3; ctx.beginPath(); track.forEach((p,i)=>i?ctx.lineTo(p.x,p.y):ctx.moveTo(p.x,p.y)); ctx.stroke(); }
+  if(flash && performance.now()-flash.t<2500){
+    ctx.strokeStyle=flash.ok?'#22c55e':'#ef4444'; ctx.lineWidth=6; ctx.beginPath(); ctx.arc(flash.x,flash.y,34,0,7); ctx.stroke();
+  }
+}
+function loop(){
+  detect(); checkMissing(performance.now()); draw();
+  requestAnimationFrame(loop);
+}
+render();
+</script>
+</body>
+</html>
